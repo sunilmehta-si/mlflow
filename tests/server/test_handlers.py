@@ -345,6 +345,9 @@ def mock_get_request_json():
 def mock_tracking_store():
     with mock.patch("mlflow.server.handlers._get_tracking_store") as m:
         mock_store = mock.MagicMock()
+        # A store with nothing in it reads as empty rather than as a truthy MagicMock, which
+        # callers that branch on "did this search find anything" would otherwise take as a hit.
+        mock_store.search_runs.return_value = []
         m.return_value = mock_store
         yield mock_store
 
@@ -548,6 +551,31 @@ def test_server_info_handles_unexpected_trace_archival_config_error(monkeypatch)
         assert response.status_code == 200
         data = response.get_json()
         assert data[SERVER_INFO_TRACE_ARCHIVAL_ENABLED] is False
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_server_info_advertises_whether_a_schedule_would_run(monkeypatch, available: bool):
+    monkeypatch.setattr(
+        "mlflow.server.handlers.scheduled_detection_available",
+        mock.Mock(return_value=available),
+    )
+
+    with app.test_client() as c:
+        response = c.get("/api/3.0/mlflow/server-info")
+        assert response.status_code == 200
+        assert response.get_json()["features_enabled"]["scheduled_issue_detection"] is available
+
+
+def test_server_info_reports_no_scheduled_detection_when_the_check_itself_fails(monkeypatch):
+    monkeypatch.setattr(
+        "mlflow.server.handlers.scheduled_detection_available",
+        mock.Mock(side_effect=RuntimeError("could not read the job configuration")),
+    )
+
+    with app.test_client() as c:
+        response = c.get("/api/3.0/mlflow/server-info")
+        assert response.status_code == 200
+        assert response.get_json()["features_enabled"]["scheduled_issue_detection"] is False
 
 
 def test_server_info_multipart_capabilities_disabled_by_default():
@@ -5836,6 +5864,31 @@ def test_get_provider_config_with_multiple_auth_modes():
         assert any(f["name"] == "aws_role_name" for f in iam_role_mode["config_fields"])
 
 
+def test_provider_config_reports_a_credential_in_the_servers_own_environment(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-from-the-environment")
+    with app.test_client() as c:
+        response = c.get("/ajax-api/3.0/mlflow/gateway/provider-config?provider=openai")
+        assert response.status_code == 200
+        assert response.get_json()["env_credentials_available"] is True
+
+
+def test_provider_config_reports_no_credential_when_the_environment_has_none(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    with app.test_client() as c:
+        response = c.get("/ajax-api/3.0/mlflow/gateway/provider-config?provider=openai")
+        assert response.status_code == 200
+        assert response.get_json()["env_credentials_available"] is False
+
+
+def test_provider_config_ignores_a_non_credential_variable_of_the_same_provider(monkeypatch):
+    # OpenAI reads a base URL as well as a key, but only a key lets a run authenticate.
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_BASE", "https://example.invalid/v1")
+    with app.test_client() as c:
+        response = c.get("/ajax-api/3.0/mlflow/gateway/provider-config?provider=openai")
+        assert response.get_json()["env_credentials_available"] is False
+
+
 def test_get_provider_config_missing_provider():
     with app.test_client() as c:
         response = c.get("/ajax-api/3.0/mlflow/gateway/provider-config")
@@ -10436,6 +10489,7 @@ def test_invoke_issue_detection_handler_success(monkeypatch):
         mock.patch("mlflow.end_run"),
         app.test_client() as c,
     ):
+        mock_store.return_value.search_runs.return_value = []
         resp = c.post(
             "/ajax-api/3.0/mlflow/issues/invoke",
             json=request_json,
@@ -10454,6 +10508,45 @@ def test_invoke_issue_detection_handler_success(monkeypatch):
         assert call_kwargs["params"]["categories"] == ["correctness", "safety"]
         assert call_kwargs["params"]["model"] == "openai:/gpt-4o"
         assert call_kwargs["extra_envs"] == {"OPENAI_API_KEY": "test-key"}
+
+
+def test_invoke_issue_detection_handler_rejects_a_second_concurrent_run(
+    monkeypatch, mock_tracking_store
+):
+    # Ad-hoc and scheduled detection must not overlap: both would analyze the same traces and
+    # file the same findings, paying the model twice for one answer. Rejected at submission with
+    # a message naming the run, because the job engine's exclusive lock cannot express it (the
+    # key is per job name) and its contention behaviour is to cancel the loser.
+    monkeypatch.setenv("MLFLOW_SERVER_ENABLE_JOB_EXECUTION", "true")
+    # Enough of a credential for the fail-fast check above the guard to pass, so the refusal
+    # under test is the concurrent run rather than a missing key.
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    in_flight = mock.MagicMock()
+    in_flight.info.run_id = "run-already-going"
+    mock_tracking_store.search_runs.return_value = [in_flight]
+
+    with (
+        mock.patch("mlflow.server.jobs.submit_job") as submit_job,
+        mock.patch("mlflow.start_run") as start_run,
+        app.test_client() as c,
+    ):
+        resp = c.post(
+            "/ajax-api/3.0/mlflow/issues/invoke",
+            json={
+                "experiment_id": "exp-123",
+                "trace_ids": ["trace-1"],
+                "categories": ["correctness"],
+                "provider": "openai",
+                "model": "gpt-4o",
+            },
+        )
+
+    assert resp.status_code == 400
+    assert resp.get_json()["error_code"] == "RESOURCE_ALREADY_EXISTS"
+    assert "run-already-going" in resp.get_json()["message"]
+    # Rejected before anything is created, so a blocked request leaves no orphan run behind.
+    start_run.assert_not_called()
+    submit_job.assert_not_called()
 
 
 def test_invoke_issue_detection_handler_rejects_cross_experiment_traces(
