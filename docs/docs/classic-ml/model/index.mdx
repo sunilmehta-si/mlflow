@@ -97,10 +97,7 @@ For wheeled models, `original_requirements.txt` file is also copied.
 When a model registered in the MLflow Model Registry is downloaded, a YAML file named
 `registered_model_meta` is added to the model directory on the downloader's side.
 This file contains the name and version of the model referenced in the MLflow Model Registry,
-and will be used for deployment and other purposes. It is not part of the logged model, so if the
-downloaded directory must match the logged model exactly (for example, to verify a signature or a
-hash manifest over it), set the `MLFLOW_DISABLE_REGISTERED_MODEL_META_FILE` environment variable to
-`true` before downloading.
+and will be used for deployment and other purposes.
 :::
 
 :::warning[attention]
